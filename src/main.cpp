@@ -34,7 +34,7 @@
 
 // ========================== 硬件引脚 ==========================
 #define JOY_X_PIN   4
-#define JOY_Y_PIN   5
+#define JOY_Y_PIN   0
 #define JOY_SW_PIN  3
 
 // ========================== BLE 接口 ==========================
@@ -120,7 +120,7 @@ class RemoteServerCallbacks : public BLEServerCallbacks {
 };
 
 // ========================== 协议发送 ==========================
-void printProtocol(uint8_t command) {                   
+void printProtocol(uint8_t command) {
   Serial.printf("AA 01 %02X\n", command);
 }
 
