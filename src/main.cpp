@@ -12,12 +12,12 @@
  *
  * 接线：
  * VRX -> GPIO4
- * VRY -> GPIO5
- * SW  -> GPIO3
- * VCC -> 3.3V
+ * VRY -> GPIO0
+ * SW  -> GPIO1
+ * VCC -> 3.3V 
  * GND -> GND
  *
- * 建议：GPIO3 与 3.3V 之间增加 10kΩ 外部上拉电阻，提高深度睡眠唤醒可靠性。
+ * 建议：GPIO1 与 3.3V 之间增加 10kΩ 外部上拉电阻，提高深度睡眠唤醒可靠性。
  */
 
 #include <Arduino.h>
@@ -29,13 +29,13 @@
 #include "driver/gpio.h"
 
 #if !CONFIG_IDF_TARGET_ESP32C3
-#error "请选择 ESP32C3 Dev Module 编译本工程"
+#error "请选择 ESP32C3 Dev Module 编译本工程" 
 #endif
 
 // ========================== 硬件引脚 ==========================
 #define JOY_X_PIN   4
-#define JOY_Y_PIN   0
-#define JOY_SW_PIN  3
+#define JOY_Y_PIN   3
+#define JOY_SW_PIN  1
 
 // ========================== BLE 接口 ==========================
 #define DEVICE_NAME "IG_REMOTE_S3"
@@ -193,6 +193,8 @@ void initializeBLE() {
   Serial.println("开始初始化 BLE……");
 
   BLEDevice::init(DEVICE_NAME);
+  Serial.print("BLE MAC地址：");
+  Serial.println(BLEDevice::getAddress().toString().c_str());
 
   bleServer = BLEDevice::createServer();
   bleServer->setCallbacks(new RemoteServerCallbacks());
