@@ -423,15 +423,15 @@ void sendCurrentCommandContinuously() {
 }
 
 // ========================== Arduino 入口 ==========================
-void setup() {
+void setup() { 
   Serial.begin(115200);
   delay(500);
 
   ++bootCount;
 
   pinMode(JOY_SW_PIN, INPUT_PULLUP);
-  gpio_pullup_en(GPIO_NUM_3);
-  gpio_pulldown_dis(GPIO_NUM_3);
+  gpio_pullup_en(GPIO_NUM_1);
+  gpio_pulldown_dis(GPIO_NUM_1);
   analogReadResolution(12);
 
   Serial.println();
