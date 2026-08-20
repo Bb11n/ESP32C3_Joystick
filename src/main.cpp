@@ -12,7 +12,7 @@
  *
  * 接线：
  * VRX -> GPIO4
- * VRY -> GPIO0
+ * VRY -> GPIO3
  * SW  -> GPIO1
  * VCC -> 3.3V 
  * GND -> GND
