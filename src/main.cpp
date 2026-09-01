@@ -8,16 +8,16 @@
  * 4. 摇杆方向改变后锁存命令；摇杆回中不清除上一条命令。
  * 5. 摇杆 SW 短按：AA 01 00（主页）。
  * 6. 摇杆 SW 长按 2 秒：发送 5 次 AA 01 FF，松开后进入深度睡眠。
- * 7. 深度睡眠后按一下 SW：GPIO3 唤醒，重新运行 setup()、初始化 BLE 并广播。
+ * 7. 深度睡眠后按一下 SW：GPIO0 唤醒，重新运行 setup()、初始化 BLE 并广播。
  *
  * 接线：
  * VRX -> GPIO4
  * VRY -> GPIO3
- * SW  -> GPIO1
+ * SW  -> GPIO0
  * VCC -> 3.3V 
  * GND -> GND
  *
- * 建议：GPIO1 与 3.3V 之间增加 10kΩ 外部上拉电阻，提高深度睡眠唤醒可靠性。
+ * 建议：GPIO0 与 3.3V 之间增加 10kΩ 外部上拉电阻，提高深度睡眠唤醒可靠性。
  */
 
 #include <Arduino.h>
@@ -35,7 +35,7 @@
 // ========================== 硬件引脚 ==========================
 #define JOY_X_PIN   4
 #define JOY_Y_PIN   3
-#define JOY_SW_PIN  1
+#define JOY_SW_PIN  0
 
 // ========================== BLE 接口 ==========================
 #define DEVICE_NAME "IG_REMOTE_S3"
@@ -62,6 +62,9 @@ constexpr unsigned long SEND_INTERVAL_MS      = 20;
 constexpr unsigned long JOYSTICK_INTERVAL_MS  = 2;
 constexpr unsigned long BUTTON_DEBOUNCE_MS    = 15;
 constexpr unsigned long LONG_PRESS_MS         = 2000;
+constexpr unsigned long ADVERTISING_RESTART_DELAY_MS = 500;
+constexpr unsigned long ADVERTISING_RETRY_INTERVAL_MS = 2000;
+constexpr unsigned long ADVERTISING_START_TIMEOUT_MS = 1000;
 
 // ========================== 摇杆参数 ==========================
 int centerX = 2048;
@@ -74,6 +77,14 @@ BLECharacteristic* txCharacteristic = nullptr;
 
 volatile bool deviceConnected = false;
 volatile bool restartAdvertisingRequested = false;
+volatile bool advertisingStartResultReady = false;
+volatile bool advertisingStartSucceeded = false;
+
+bool advertisingRecoveryActive = false;
+bool advertisingStartPending = false;
+unsigned long advertisingRecoveryStartTime = 0;
+unsigned long lastAdvertisingStartTime = 0;
+uint32_t advertisingStartAttempt = 0;
 
 uint8_t currentCommand = CMD_BLANK;
 unsigned long lastSendTime = 0;
@@ -85,16 +96,35 @@ bool stableButtonState = HIGH;
 unsigned long buttonChangeTime = 0;
 unsigned long buttonPressStartTime = 0;
 bool longPressTriggered = false;
+bool buttonInputArmed = false;
 
 // 深度睡眠期间保留
 RTC_DATA_ATTR uint32_t bootCount = 0;
 
 // ========================== BLE 回调 ==========================
+void handleGapEvent(
+    esp_gap_ble_cb_event_t event,
+    esp_ble_gap_cb_param_t* param) {
+  if (param == nullptr) {
+    return;
+  }
+
+  if (event == ESP_GAP_BLE_ADV_START_COMPLETE_EVT) {
+    advertisingStartSucceeded =
+        param->adv_start_cmpl.status == ESP_BT_STATUS_SUCCESS;
+    advertisingStartResultReady = true;
+  } else if (event == ESP_GAP_BLE_ADV_STOP_COMPLETE_EVT &&
+             !deviceConnected) {
+    restartAdvertisingRequested = true;
+  }
+}
+
 class RemoteServerCallbacks : public BLEServerCallbacks {
  public:
   void onConnect(BLEServer* server) override {
     (void)server;
     deviceConnected = true;
+    restartAdvertisingRequested = false;
     currentCommand = CMD_BLANK;
     lastSendTime = 0;
 
@@ -193,6 +223,7 @@ void initializeBLE() {
   Serial.println("开始初始化 BLE……");
 
   BLEDevice::init(DEVICE_NAME);
+  BLEDevice::setCustomGapHandler(handleGapEvent);
   Serial.print("BLE MAC地址：");
   Serial.println(BLEDevice::getAddress().toString().c_str());
 
@@ -222,53 +253,124 @@ void initializeBLE() {
   BLEAdvertising* advertising = BLEDevice::getAdvertising();
   advertising->addServiceUUID(SERVICE_UUID);
   advertising->setScanResponse(true);
-  advertising->start();
 
   currentCommand = CMD_BLANK;
   deviceConnected = false;
   restartAdvertisingRequested = false;
+  advertisingStartResultReady = false;
+  advertisingStartSucceeded = false;
+  advertisingRecoveryActive = true;
+  advertisingStartPending = true;
+  advertisingRecoveryStartTime = millis();
+  lastAdvertisingStartTime = advertisingRecoveryStartTime;
+  advertisingStartAttempt = 1;
+
+  advertising->start();
 
   Serial.println("BLE 初始化完成");
   Serial.println("设备名称：IG_REMOTE_S3");
-  Serial.println("BLE 广播已启动");
+  Serial.println("BLE 广播已请求启动");
   Serial.println("等待 IG 连接……");
 }
 
 void updateAdvertising() {
-  if (!restartAdvertisingRequested) {
+  const unsigned long now = millis();
+
+  if (deviceConnected) {
+    advertisingRecoveryActive = false;
+    advertisingStartPending = false;
+    advertisingStartResultReady = false;
     return;
   }
 
-  restartAdvertisingRequested = false;
-  delay(500);
+  if (restartAdvertisingRequested) {
+    restartAdvertisingRequested = false;
+    advertisingStartResultReady = false;
+    advertisingRecoveryActive = true;
+    advertisingStartPending = false;
+    advertisingRecoveryStartTime = now;
+    lastAdvertisingStartTime = 0;
+    advertisingStartAttempt = 0;
+  }
+
+  if (!advertisingRecoveryActive) {
+    return;
+  }
+
+  if (advertisingStartResultReady) {
+    advertisingStartResultReady = false;
+    advertisingStartPending = false;
+
+    if (advertisingStartSucceeded) {
+      advertisingRecoveryActive = false;
+
+      Serial.println();
+      Serial.print("BLE 广播启动成功，尝试次数：");
+      Serial.println(advertisingStartAttempt);
+      Serial.println("等待 IG 连接……");
+      return;
+    }
+
+    Serial.println();
+    Serial.println("BLE 广播启动失败，将自动重试");
+  }
+
+  if (advertisingStartPending) {
+    if (now - lastAdvertisingStartTime <
+        ADVERTISING_START_TIMEOUT_MS) {
+      return;
+    }
+
+    advertisingStartPending = false;
+    Serial.println();
+    Serial.println("BLE 广播启动等待超时，将自动重试");
+  }
+
+  const unsigned long waitTime =
+      advertisingStartAttempt == 0
+          ? ADVERTISING_RESTART_DELAY_MS
+          : ADVERTISING_RETRY_INTERVAL_MS;
+  const unsigned long waitStartTime =
+      advertisingStartAttempt == 0
+          ? advertisingRecoveryStartTime
+          : lastAdvertisingStartTime;
+
+  if (now - waitStartTime < waitTime) {
+    return;
+  }
+
+  ++advertisingStartAttempt;
+  advertisingStartPending = true;
+  lastAdvertisingStartTime = now;
 
   BLEDevice::startAdvertising();
 
   Serial.println();
-  Serial.println("BLE 广播已重新启动");
-  Serial.println("等待 IG 重新连接……");
+  Serial.print("尝试重新启动 BLE 广播，第 ");
+  Serial.print(advertisingStartAttempt);
+  Serial.println(" 次");
 }
 
 // ========================== 深度睡眠 ==========================
 bool configureWakeup() {
   esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
 
-  gpio_pullup_en(GPIO_NUM_3);
-  gpio_pulldown_dis(GPIO_NUM_3);
+  gpio_pullup_en(static_cast<gpio_num_t>(JOY_SW_PIN));
+  gpio_pulldown_dis(static_cast<gpio_num_t>(JOY_SW_PIN));
 
   const esp_err_t result = esp_deep_sleep_enable_gpio_wakeup(
       1ULL << JOY_SW_PIN,
       ESP_GPIO_WAKEUP_GPIO_LOW);
 
-  Serial.print("GPIO3 唤醒配置结果：");
+  Serial.print("GPIO0 唤醒配置结果：");
   Serial.println(static_cast<int>(result));
 
   if (result != ESP_OK) {
-    Serial.println("GPIO3 唤醒配置失败");
+    Serial.println("GPIO0 唤醒配置失败");
     return false;
   }
 
-  Serial.println("GPIO3 低电平唤醒配置成功");
+  Serial.println("GPIO0 低电平唤醒配置成功");
   return true;
 }
 
@@ -290,11 +392,11 @@ void enterDeepSleep() {
   delay(200);
 
   const int pinLevel = digitalRead(JOY_SW_PIN);
-  Serial.print("进入睡眠前 GPIO3 电平：");
+  Serial.print("进入睡眠前 GPIO0 电平：");
   Serial.println(pinLevel);
 
   if (pinLevel != HIGH) {
-    Serial.println("GPIO3 没有恢复高电平，取消睡眠");
+    Serial.println("GPIO0 没有恢复高电平，取消睡眠");
     return;
   }
 
@@ -323,7 +425,7 @@ void processWakeupReason() {
   Serial.println(static_cast<int>(cause));
 
   if (cause == ESP_SLEEP_WAKEUP_GPIO) {
-    Serial.println("GPIO3 按键唤醒成功");
+    Serial.println("GPIO0 按键唤醒成功");
     Serial.println("请松开唤醒按键……");
 
     while (digitalRead(JOY_SW_PIN) == LOW) {
@@ -382,6 +484,18 @@ void updateJoystickButton() {
     buttonChangeTime = now;
   }
 
+  // 上电或唤醒后必须先确认按键稳定松开，避免初始低电平被误判为长按。
+  if (!buttonInputArmed) {
+    if (rawState == HIGH &&
+        now - buttonChangeTime >= BUTTON_DEBOUNCE_MS) {
+      stableButtonState = HIGH;
+      buttonInputArmed = true;
+      longPressTriggered = false;
+      Serial.println("摇杆按键已松开，输入已启用");
+    }
+    return;
+  }
+
   if ((now - buttonChangeTime >= BUTTON_DEBOUNCE_MS) &&
       rawState != stableButtonState) {
     stableButtonState = rawState;
@@ -430,8 +544,8 @@ void setup() {
   ++bootCount;
 
   pinMode(JOY_SW_PIN, INPUT_PULLUP);
-  gpio_pullup_en(GPIO_NUM_1);
-  gpio_pulldown_dis(GPIO_NUM_1);
+  gpio_pullup_en(GPIO_NUM_0);
+  gpio_pulldown_dis(GPIO_NUM_0);
   analogReadResolution(12);
 
   Serial.println();
@@ -448,8 +562,15 @@ void setup() {
   lastRawButtonState = digitalRead(JOY_SW_PIN);
   stableButtonState = lastRawButtonState;
   buttonChangeTime = millis();
-  buttonPressStartTime = millis();
+  buttonPressStartTime = 0;
   longPressTriggered = false;
+  buttonInputArmed = false;
+
+  Serial.print("SW(GPIO0) 启动电平：");
+  Serial.println(lastRawButtonState == HIGH ? "HIGH" : "LOW");
+  if (lastRawButtonState == LOW) {
+    Serial.println("SW 启动时为低电平，等待松开后再启用按键");
+  }
 
   initializeBLE();
 }
